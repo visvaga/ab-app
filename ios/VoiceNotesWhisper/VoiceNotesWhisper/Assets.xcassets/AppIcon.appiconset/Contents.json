@@ -1,0 +1,38 @@
+{
+  "images" : [
+    {
+      "filename" : "Bazaart_D3537767-D97F-4D4A-A7F4-EFA4321274A1.jpeg",
+      "idiom" : "universal",
+      "platform" : "ios",
+      "size" : "1024x1024"
+    },
+    {
+      "appearances" : [
+        {
+          "appearance" : "luminosity",
+          "value" : "dark"
+        }
+      ],
+      "filename" : "Bazaart_D3537767-D97F-4D4A-A7F4-EFA4321274A1 1.jpeg",
+      "idiom" : "universal",
+      "platform" : "ios",
+      "size" : "1024x1024"
+    },
+    {
+      "appearances" : [
+        {
+          "appearance" : "luminosity",
+          "value" : "tinted"
+        }
+      ],
+      "filename" : "Bazaart_D3537767-D97F-4D4A-A7F4-EFA4321274A1 2.jpeg",
+      "idiom" : "universal",
+      "platform" : "ios",
+      "size" : "1024x1024"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
