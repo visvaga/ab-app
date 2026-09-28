@@ -5,8 +5,10 @@ import WhisperKit
 import Speech
 import UIKit
 import AudioToolbox
+import Darwin
 private let firstLaunchTipsSeenKey = "firstLaunchTipsSeen"
 private let whisperModelPreparedOnceKey = "whisperModelPreparedOnce"
+private let unsupportedDeviceChoiceKey = "unsupportedDeviceChoice"
 
 private func logAudioSessionState(_ place: String) {
     let session = AVAudioSession.sharedInstance()
@@ -65,6 +67,42 @@ private func restorePlaybackAudioSessionAfterDictation() {
     }
 }
 
+private enum UnsupportedDeviceChoice: String {
+    case undecided
+    case useAnyway
+    case doNotUse
+}
+
+private func currentDeviceIdentifier() -> String {
+    var size: size_t = 0
+    sysctlbyname("hw.machine", nil, &size, nil, 0)
+
+    var machine = [CChar](repeating: 0, count: Int(size))
+    sysctlbyname("hw.machine", &machine, &size, nil, 0)
+
+    return String(cString: machine)
+}
+
+private func isDeviceOlderThanIPhone12() -> Bool {
+    let device = currentDeviceIdentifier()
+
+    print("[DEVICE] identifier=\(device)")
+
+    // iPhone 11
+    if device == "iPhone12,1" ||
+        device == "iPhone12,3" ||
+        device == "iPhone12,5" {
+        return true
+    }
+
+    // iPhone SE 2020
+    if device == "iPhone12,8" {
+        return true
+    }
+
+    return false
+}
+
 struct ContentView: View {
     @StateObject private var recorder = AudioRecorder()
     @StateObject private var liveRecognizer = LiveSpeechRecognizer()
@@ -73,6 +111,8 @@ struct ContentView: View {
     @State private var isShareSheetPresented = false
     @State private var welcomeAlertStep = 0
     @State private var topStatusText = "Готово"
+    @State private var showUnsupportedDeviceAlert = false
+    @State private var unsupportedDeviceChoice: UnsupportedDeviceChoice = .undecided
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -201,8 +241,18 @@ struct ContentView: View {
                             RecordCircleButton(isRecording: false)
                         }
                         .buttonStyle(.plain)
-                        .disabled(transcriber.isTranscribing || !transcriber.isModelReady)
-                        .opacity(transcriber.isTranscribing || !transcriber.isModelReady ? 0.45 : 1)
+                        .disabled(
+                            transcriber.isTranscribing ||
+                            !transcriber.isModelReady ||
+                            unsupportedDeviceChoice == .doNotUse
+                        )
+                        .opacity(
+                            transcriber.isTranscribing ||
+                            !transcriber.isModelReady ||
+                            unsupportedDeviceChoice == .doNotUse
+                            ? 0.45
+                            : 1
+                        )
                     }
 
                     Spacer()
@@ -246,14 +296,44 @@ struct ContentView: View {
                         }
                     } else {
                         welcomeAlertStep = 0
+                        requestInitialPermissionsAfterWelcome()
+
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                            showUnsupportedDeviceWarningIfNeeded()
+                        }
                     }
                 }
             } message: {
                 Text(welcomeAlertMessage)
             }
+            .alert("Пунктуация может не работать", isPresented: $showUnsupportedDeviceAlert) {
+                Button("Использовать всё равно") {
+                    unsupportedDeviceChoice = .useAnyway
+                    UserDefaults.standard.set(
+                        UnsupportedDeviceChoice.useAnyway.rawValue,
+                        forKey: unsupportedDeviceChoiceKey
+                    )
+                    UserDefaults.standard.synchronize()
+                }
+
+                Button("Не использовать", role: .cancel) {
+                    unsupportedDeviceChoice = .doNotUse
+                    UserDefaults.standard.set(
+                        UnsupportedDeviceChoice.doNotUse.rawValue,
+                        forKey: unsupportedDeviceChoiceKey
+                    )
+                    UserDefaults.standard.synchronize()
+                    topStatusText = "Устройство не поддерживается"
+                }
+            } message: {
+                Text("На вашем устройстве модель может не расставить пунктуацию. Хотите использовать приложение для обычной диктовки? Оно может работать нестабильно. Поддерживаемые модели: iPhone 12 и новее.")
+            }
             .onAppear {
+                loadUnsupportedDeviceChoice()
                 startDictationIfRequestedFromShortcut()
                 showFirstLaunchTipsIfNeeded()
+                showUnsupportedDeviceWarningIfNeeded()
+
                 transcriber.preloadModelInBackground { status in
                     if !recorder.isRecording && !transcriber.isTranscribing {
                         topStatusText = status
@@ -346,6 +426,61 @@ struct ContentView: View {
         UserDefaults.standard.synchronize()
 
         welcomeAlertStep = 1
+    }
+    
+    private func loadUnsupportedDeviceChoice() {
+        let rawValue = UserDefaults.standard.string(forKey: unsupportedDeviceChoiceKey)
+
+        unsupportedDeviceChoice = UnsupportedDeviceChoice(rawValue: rawValue ?? "")
+            ?? .undecided
+    }
+
+    private func showUnsupportedDeviceWarningIfNeeded() {
+        guard isDeviceOlderThanIPhone12() else {
+            return
+        }
+
+        guard unsupportedDeviceChoice == .undecided else {
+            return
+        }
+
+        // If welcome tips are visible, wait until they close.
+        // Если приветственные окна открыты, ждём их закрытия.
+        guard welcomeAlertStep == 0 else {
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            showUnsupportedDeviceAlert = true
+        }
+    }
+    
+    private func requestInitialPermissionsAfterWelcome() {
+        let statusBeforePermissions = topStatusText
+
+        Task {
+            print("[PERMISSIONS] initial request START")
+
+            let microphoneGranted = await recorder.requestMicrophonePermissionOnly()
+            print("[PERMISSIONS] microphone granted=\(microphoneGranted)")
+
+            let speechGranted = await liveRecognizer.requestSpeechPermissionOnly()
+            print("[PERMISSIONS] speech granted=\(speechGranted)")
+
+            await MainActor.run {
+                if !microphoneGranted {
+                    topStatusText = "Нет доступа к микрофону"
+                } else if !speechGranted {
+                    topStatusText = "Нет доступа к распознаванию речи"
+                } else if transcriber.isModelReady {
+                    topStatusText = "Готово"
+                } else {
+                    topStatusText = statusBeforePermissions
+                }
+
+                print("[PERMISSIONS] initial request DONE")
+            }
+        }
     }
     
     private func displayedRecordingText() -> String {
@@ -488,6 +623,10 @@ func stopRecording() {
         return FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
     }
 
+    func requestMicrophonePermissionOnly() async -> Bool {
+        await requestMicrophonePermission()
+    }
+    
     private func requestMicrophonePermission() async -> Bool {
         await withCheckedContinuation { continuation in
             AVAudioApplication.requestRecordPermission { granted in
@@ -574,6 +713,10 @@ final class LiveSpeechRecognizer: ObservableObject {
         recognitionTask = nil
     }
 
+    func requestSpeechPermissionOnly() async -> Bool {
+        await requestSpeechAuthorization()
+    }
+    
     private func requestSpeechAuthorization() async -> Bool {
         await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
@@ -666,32 +809,57 @@ final class WhisperTranscriber: ObservableObject {
         print("[STATUS] Загружаю модель Whisper...")
 
         do {
-            let whisperKit = try await loadWhisperKitIfNeeded()
+    print("[WHISPER-DIAG] transcribe() ENTER")
+    print("[WHISPER-DIAG] audio url=\(url.path)")
 
-            statusText = "Финально расшифровываю..."
-            print("[STATUS] Финально расшифровываю...")
+    let audioSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? -1
+    print("[WHISPER-DIAG] audio size bytes=\(audioSize)")
 
-            let options = DecodingOptions(
-                task: .transcribe,
-                language: "ru",
-                temperature: 0,
-                temperatureFallbackCount: 0,
-                usePrefillPrompt: true,
-                detectLanguage: false
-            )
+    print("[WHISPER-DIAG] loadWhisperKitIfNeeded START")
+    let loadStart = Date()
+
+    let whisperKit = try await loadWhisperKitIfNeeded()
+
+    let loadElapsed = Date().timeIntervalSince(loadStart)
+    print("[WHISPER-DIAG] loadWhisperKitIfNeeded DONE seconds=\(loadElapsed)")
+
+    statusText = "Финально расшифровываю..."
+    print("[STATUS] Финально расшифровываю...")
+
+    print("[WHISPER-DIAG] DecodingOptions CREATE")
+
+    let options = DecodingOptions(
+        task: .transcribe,
+        language: "ru",
+        temperature: 0,
+        temperatureFallbackCount: 0,
+        usePrefillPrompt: true,
+        detectLanguage: false
+    )
+
+            print("[WHISPER-DIAG] DecodingOptions DONE")
+            print("[WHISPER-DIAG] whisperKit.transcribe START")
+            let transcribeStart = Date()
 
             let results = try await whisperKit.transcribe(
                 audioPath: url.path,
                 decodeOptions: options
             )
 
-            let rawText = results
-                .map { $0.text }
-                .joined(separator: " ")
-                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    let transcribeElapsed = Date().timeIntervalSince(transcribeStart)
+    print("[WHISPER-DIAG] whisperKit.transcribe DONE seconds=\(transcribeElapsed)")
+    print("[WHISPER-DIAG] result segments count=\(results.count)")
 
-            let cleanedWhisperText = cleanupTranscriptCommandsOnly(rawText)
-            let cleanedLiveText = cleanupTranscriptCommandsOnly(liveText)
+    let rawText = results
+        .map { $0.text }
+        .joined(separator: " ")
+        .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+    print("[WHISPER-DIAG] rawText chars=\(rawText.count)")
+    print("[WHISPER-DIAG] rawText preview=\(String(rawText.prefix(120)))")
+
+    let cleanedWhisperText = cleanupTranscriptCommandsOnly(rawText)
+    let cleanedLiveText = cleanupTranscriptCommandsOnly(liveText)
 
             if cleanedLiveText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 // If Apple live recognition heard nothing, ignore Whisper output completely.
@@ -714,8 +882,11 @@ final class WhisperTranscriber: ObservableObject {
 
                 print("[STATUS] \(statusText)")
             }
-        } catch {
-            let cleanedLiveFallback = cleanupTranscriptCommandsOnly(liveText)
+} catch {
+    print("[WHISPER-DIAG] CATCH error=\(error.localizedDescription)")
+    print("[WHISPER-DIAG] CATCH debug=\(String(reflecting: error))")
+
+    let cleanedLiveFallback = cleanupTranscriptCommandsOnly(liveText)
 
             if cleanedLiveFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 transcript = "*тишина*"
