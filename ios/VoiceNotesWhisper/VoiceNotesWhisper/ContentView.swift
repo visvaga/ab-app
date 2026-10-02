@@ -6,6 +6,8 @@ import Speech
 import UIKit
 import AudioToolbox
 import Darwin
+import FirebaseCrashlytics
+//import FirebaseAnalytics
 private let firstLaunchTipsSeenKey = "firstLaunchTipsSeen"
 private let whisperModelPreparedOnceKey = "whisperModelPreparedOnce"
 private let unsupportedDeviceChoiceKey = "unsupportedDeviceChoice"
@@ -30,7 +32,9 @@ private func playRecordingStartSound() {
     logAudioSessionState("BEFORE START SOUND 1113")
 
     print("[SOUND] play start sound 1113")
+    Crashlytics.crashlytics().log("About to play start sound 1113")
     AudioServicesPlaySystemSound(1113)
+    Crashlytics.crashlytics().log("Start sound 1113 requested")
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
         logAudioSessionState("AFTER START SOUND 1113")
@@ -254,6 +258,7 @@ struct ContentView: View {
                             : 1
                         )
                     }
+                    
 
                     Spacer()
 
@@ -348,11 +353,54 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 startDictationIfRequestedFromShortcut()
             }
+            .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { notification in
+                let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 0
+                let type = AVAudioSession.InterruptionType(rawValue: rawType)
+
+                Crashlytics.crashlytics().setCustomValue(rawType, forKey: "audioInterruptionType")
+                Crashlytics.crashlytics().setCustomValue(true, forKey: "audioInterruptionSinceDictationStart")
+
+                if type == .began {
+                    Crashlytics.crashlytics().log("Audio interruption began")
+                } else if type == .ended {
+                    Crashlytics.crashlytics().log("Audio interruption ended")
+                } else {
+                    Crashlytics.crashlytics().log("Audio interruption unknown type \(rawType)")
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)) { notification in
+                let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+                let session = AVAudioSession.sharedInstance()
+
+                let inputs = session.currentRoute.inputs
+                    .map { $0.portType.rawValue }
+                    .joined(separator: ",")
+
+                let outputs = session.currentRoute.outputs
+                    .map { $0.portType.rawValue }
+                    .joined(separator: ",")
+
+                Crashlytics.crashlytics().setCustomValue(rawReason, forKey: "audioRouteChangeReason")
+                Crashlytics.crashlytics().setCustomValue(inputs, forKey: "audioRouteInputs")
+                Crashlytics.crashlytics().setCustomValue(outputs, forKey: "audioRouteOutputs")
+                Crashlytics.crashlytics().setCustomValue(true, forKey: "audioRouteChangedSinceDictationStart")
+                Crashlytics.crashlytics().log("Audio route changed reason=\(rawReason)")
+            }
         }
     }
 
     private func startDictation(fromShortcut: Bool) {
         guard !recorder.isRecording, !transcriber.isTranscribing else { return }
+
+        
+        Crashlytics.crashlytics().setCustomValue(fromShortcut, forKey: "fromShortcut")
+        Crashlytics.crashlytics().setCustomValue(transcriber.isModelReady, forKey: "modelReady")
+        Crashlytics.crashlytics().setCustomValue(recorder.isRecording, forKey: "recorderIsRecording")
+        Crashlytics.crashlytics().log("startDictation called")
+        
+        Crashlytics.crashlytics().setCustomValue(false, forKey: "audioRecorderDidStart")
+        Crashlytics.crashlytics().setCustomValue(false, forKey: "audioInterruptionSinceDictationStart")
+        Crashlytics.crashlytics().setCustomValue(false, forKey: "audioRouteChangedSinceDictationStart")
 
         if fromShortcut {
             transcriber.prefixTextForNextTranscription = ""
@@ -571,6 +619,8 @@ private func startRecordingOnMainThread() {
         print("[RECORDER] calling recorder.record()")
 
         let didStart = recorder.record()
+        Crashlytics.crashlytics().setCustomValue(didStart, forKey: "audioRecorderDidStart")
+        Crashlytics.crashlytics().log("AVAudioRecorder record() returned \(didStart)")
 
         print("[RECORDER] recorder.record() returned=\(didStart)")
 
@@ -607,7 +657,9 @@ func stopRecording() {
 
     logAudioSessionState("RECORDER BEFORE STOP")
 
+    Crashlytics.crashlytics().log("About to stop AVAudioRecorder")
     audioRecorder?.stop()
+    Crashlytics.crashlytics().log("AVAudioRecorder stop() completed")
     audioRecorder = nil
     isRecording = false
     statusText = "Запись остановлена"
@@ -675,12 +727,19 @@ final class LiveSpeechRecognizer: ObservableObject {
             let recordingFormat = inputNode.outputFormat(forBus: 0)
 
             inputNode.removeTap(onBus: 0)
+            Crashlytics.crashlytics().setCustomValue(audioEngine.isRunning, forKey: "audioEngineRunningBeforeInstallTap")
+            Crashlytics.crashlytics().setCustomValue(recordingFormat.sampleRate, forKey: "recordingFormatSampleRate")
+            Crashlytics.crashlytics().setCustomValue(recordingFormat.channelCount, forKey: "recordingFormatChannels")
+            Crashlytics.crashlytics().log("About to install audio tap")
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
                 request.append(buffer)
             }
+            Crashlytics.crashlytics().log("Audio tap installed successfully")
 
             audioEngine.prepare()
+            Crashlytics.crashlytics().log("About to start AVAudioEngine")
             try audioEngine.start()
+            Crashlytics.crashlytics().log("AVAudioEngine started successfully")
 
             recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
                 Task { @MainActor in
@@ -701,6 +760,8 @@ final class LiveSpeechRecognizer: ObservableObject {
     }
 
     func stopLiveRecognition() {
+        Crashlytics.crashlytics().setCustomValue(audioEngine.isRunning, forKey: "audioEngineRunningOnStop")
+        Crashlytics.crashlytics().log("stopLiveRecognition called")
         if audioEngine.isRunning {
             audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
@@ -754,6 +815,8 @@ final class WhisperTranscriber: ObservableObject {
             do {
                 let wasPreparedBefore = UserDefaults.standard.bool(forKey: whisperModelPreparedOnceKey)
 
+
+
                 if !wasPreparedBefore {
                     statusText = "Подождите, пока загрузится модель, это нужно один раз и займет пару минут."
                     onStatus?(statusText)
@@ -763,6 +826,9 @@ final class WhisperTranscriber: ObservableObject {
                 let config = WhisperKitConfig(model: "openai_whisper-medium")
                 whisperKit = try await WhisperKit(config)
                 isModelReady = true
+
+
+
                 UserDefaults.standard.set(true, forKey: whisperModelPreparedOnceKey)
 
                 if !isTranscribing {
@@ -771,6 +837,7 @@ final class WhisperTranscriber: ObservableObject {
                     print("[STATUS] \(statusText)")
                 }
             } catch {
+           
                 if !isTranscribing {
                     statusText = "Не удалось загрузить модель. Проверьте интернет и перезапустите приложение."
                     onStatus?(statusText)
@@ -805,6 +872,8 @@ final class WhisperTranscriber: ObservableObject {
 
     func transcribe(url: URL, liveText: String) async {
         isTranscribing = true
+        Crashlytics.crashlytics().setCustomValue(true, forKey: "whisperTranscribing")
+        Crashlytics.crashlytics().log("Whisper transcription started")
         statusText = "Загружаю модель Whisper..."
         print("[STATUS] Загружаю модель Whisper...")
 
@@ -923,6 +992,8 @@ final class WhisperTranscriber: ObservableObject {
         let shouldReturnToShortcuts = UserDefaults.standard.bool(forKey: returnToShortcutsAfterTranscriptionKey)
 
         isTranscribing = false
+        Crashlytics.crashlytics().setCustomValue(false, forKey: "whisperTranscribing")
+        Crashlytics.crashlytics().log("Whisper transcription finished")
 
         restorePlaybackAudioSessionAfterDictation()
 
